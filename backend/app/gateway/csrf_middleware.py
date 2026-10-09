@@ -17,6 +17,7 @@ from starlette.types import ASGIApp
 from app.gateway.auth.config import get_auth_config
 from app.gateway.auth.session_cookie_state import SESSION_COOKIE_ISSUED_STATE_ATTR, SESSION_COOKIE_MAX_AGE_STATE_ATTR, SESSION_COOKIE_SECURE_STATE_ATTR, SKIP_AUTH_CSRF_COOKIE_STATE_ATTR
 from app.gateway.auth_disabled import is_auth_disabled
+from app.gateway.internal_auth import INTERNAL_AUTH_HEADER_NAME, is_valid_internal_auth_token
 from app.gateway.request_path import get_request_route_path
 from deerflow.trace_context import TRACE_ID_HEADER
 
@@ -227,15 +228,17 @@ class CSRFMiddleware(BaseHTTPMiddleware):
                 content={"detail": "Cross-site auth request denied."},
             )
 
-        if should_check_csrf(request) and not _is_auth and request.headers.get("authorization") is None:
-            # Bearer-authenticated requests (PAT, #4849) are exempt from the
-            # cookie double-submit check only — the cross-site origin check on
-            # auth endpoints above still runs for every request. Safety rests
-            # on AuthMiddleware's strict Bearer precedence: an invalid Bearer
-            # header is a 401 there, so a cross-site attacker cannot ride a
-            # victim's cookie by padding a garbage Authorization header, and a
-            # cross-site request carrying a custom Authorization header at all
-            # requires a CORS preflight the attacker cannot obtain.
+        # Cookie double-submit is for browser session callers. Server-to-server
+        # callers authenticate with a custom header that triggers CORS preflight
+        # and cannot be forged cross-site while riding a victim cookie:
+        # - Authorization Bearer (PAT, #4849)
+        # - X-DeerFlow-Internal-Token matching DEER_FLOW_INTERNAL_AUTH_TOKEN
+        # AuthMiddleware still 401s invalid Bearer / internal tokens; the
+        # Origin check on auth bootstrap endpoints above is unchanged.
+        has_bearer = request.headers.get("authorization") is not None
+        has_valid_internal = is_valid_internal_auth_token(request.headers.get(INTERNAL_AUTH_HEADER_NAME))
+
+        if should_check_csrf(request) and not _is_auth and not has_bearer and not has_valid_internal:
             cookie_token = request.cookies.get(CSRF_COOKIE_NAME)
             header_token = request.headers.get(CSRF_HEADER_NAME)
 
