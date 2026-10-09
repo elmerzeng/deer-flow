@@ -4,11 +4,11 @@
 # Stage 3 (runtime): clean image without compiler toolchain for production
 
 # UV source image (override for restricted networks that cannot reach ghcr.io)
-ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.11.1
+ARG UV_IMAGE=reg.hrlyit.com/astral-sh/uv:0.11.1
 FROM ${UV_IMAGE} AS uv-source
 
 # ── Stage 1: Builder ──────────────────────────────────────────────────────────
-FROM python:3.12-slim-bookworm AS builder
+FROM reg.hrlyit.com/library/python:3.12-slim-bookworm AS builder
 
 ARG NODE_MAJOR=22
 ARG APT_MIRROR
@@ -93,7 +93,7 @@ CMD ["sh", "-c", "cd backend && PYTHONPATH=. uv run --no-sync uvicorn app.gatewa
 
 # ── Stage 3: Runtime ──────────────────────────────────────────────────────────
 # Clean image without build-essential — reduces size (~200 MB) and attack surface.
-FROM python:3.12-slim-bookworm
+FROM reg.hrlyit.com/library/python:3.12-slim-bookworm
 
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8

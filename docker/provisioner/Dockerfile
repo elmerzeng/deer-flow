@@ -1,4 +1,4 @@
-FROM python:3.12-slim-bookworm
+FROM reg.hrlyit.com/library/python:3.12-slim-bookworm
 
 ARG APT_MIRROR
 ARG PIP_INDEX_URL

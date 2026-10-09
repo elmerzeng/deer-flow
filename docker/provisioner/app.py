@@ -95,6 +95,13 @@ DEER_FLOW_HOST_BASE_DIR = os.environ.get("DEER_FLOW_HOST_BASE_DIR", "/.deer-flow
 SKILLS_PVC_NAME = os.environ.get("SKILLS_PVC_NAME", "")
 USERDATA_PVC_NAME = os.environ.get("USERDATA_PVC_NAME", "")
 SKILLS_PVC_SUBPATH_TEMPLATE = os.environ.get("SKILLS_PVC_SUBPATH_TEMPLATE", "")
+# Single ``spec.volumes`` entry that backs every user-data PVC mount. A Pod must
+# reference a given CSI/CephFS PVC through exactly one volume entry: when the
+# same claim appears under multiple entries while ``subPath`` is used, kubelet
+# never completes volume setup and the Pod hangs in ``ContainerCreating`` until
+# the gateway drops it. Every user-data-backed mount (thread data, extra mounts,
+# broker credentials) shares this one entry via its own ``subPath``.
+USERDATA_VOLUME_NAME = "user-data"
 SANDBOX_CONTAINER_PORT_RAW = os.environ.get("SANDBOX_CONTAINER_PORT", "8080")
 SANDBOX_SERVICE_TYPE = os.environ.get("SANDBOX_SERVICE_TYPE", "NodePort")
 try:
@@ -529,14 +536,11 @@ def _build_extra_volumes(
         )
     ):
         if USERDATA_PVC_NAME:
-            volumes.append(
-                k8s_client.V1Volume(
-                    name=_extra_mount_volume_name(index),
-                    persistent_volume_claim=k8s_client.V1PersistentVolumeClaimVolumeSource(
-                        claim_name=USERDATA_PVC_NAME,
-                    ),
-                )
-            )
+            # PVC mode: every extra mount is served by the one shared
+            # USERDATA_VOLUME_NAME entry, referenced by subPath in
+            # _build_extra_volume_mounts. Emitting a volume per mount here would
+            # point several ``spec.volumes`` entries at the same PVC and wedge
+            # kubelet on CephFS subPath setup.
             continue
 
         volumes.append(
@@ -563,13 +567,19 @@ def _build_extra_volume_mounts(
             skills_container_path=skills_container_path,
         )
     ):
-        volume_mount = k8s_client.V1VolumeMount(
-            name=_extra_mount_volume_name(index),
-            mount_path=mount.container_path,
-            read_only=mount.read_only,
-        )
         if USERDATA_PVC_NAME:
-            volume_mount.sub_path = _extra_mount_pvc_sub_path(mount.host_path)
+            volume_mount = k8s_client.V1VolumeMount(
+                name=USERDATA_VOLUME_NAME,
+                mount_path=mount.container_path,
+                read_only=mount.read_only,
+                sub_path=_extra_mount_pvc_sub_path(mount.host_path),
+            )
+        else:
+            volume_mount = k8s_client.V1VolumeMount(
+                name=_extra_mount_volume_name(index),
+                mount_path=mount.container_path,
+                read_only=mount.read_only,
+            )
         mounts.append(volume_mount)
     return mounts
 
@@ -675,14 +685,14 @@ def _build_volumes(
 
     if USERDATA_PVC_NAME:
         userdata_vol = k8s_client.V1Volume(
-            name="user-data",
+            name=USERDATA_VOLUME_NAME,
             persistent_volume_claim=k8s_client.V1PersistentVolumeClaimVolumeSource(
                 claim_name=USERDATA_PVC_NAME,
             ),
         )
     else:
         userdata_vol = k8s_client.V1Volume(
-            name="user-data",
+            name=USERDATA_VOLUME_NAME,
             host_path=k8s_client.V1HostPathVolumeSource(
                 path=join_host_path(THREADS_HOST_PATH, thread_id, "user-data"),
                 type="DirectoryOrCreate",
@@ -724,24 +734,18 @@ def _build_volumes(
             if mount is None:
                 continue
             if USERDATA_PVC_NAME:
-                volumes.append(
-                    k8s_client.V1Volume(
-                        name=volume_name,
-                        persistent_volume_claim=k8s_client.V1PersistentVolumeClaimVolumeSource(
-                            claim_name=USERDATA_PVC_NAME,
-                        ),
-                    )
+                # Credential mounts hang off the shared USERDATA_VOLUME_NAME
+                # entry (see _build_lark_cli_broker_sidecars); no separate volume.
+                continue
+            volumes.append(
+                k8s_client.V1Volume(
+                    name=volume_name,
+                    host_path=k8s_client.V1HostPathVolumeSource(
+                        path=mount.host_path,
+                        type="Directory" if mount.read_only else "DirectoryOrCreate",
+                    ),
                 )
-            else:
-                volumes.append(
-                    k8s_client.V1Volume(
-                        name=volume_name,
-                        host_path=k8s_client.V1HostPathVolumeSource(
-                            path=mount.host_path,
-                            type="Directory" if mount.read_only else "DirectoryOrCreate",
-                        ),
-                    )
-                )
+            )
     return volumes
 
 
@@ -811,7 +815,7 @@ def _build_volume_mounts(
         mounts.extend(mount for mount in default_skill_mounts if mount.mount_path not in skill_overrides)
 
     userdata_mount = k8s_client.V1VolumeMount(
-        name="user-data",
+        name=USERDATA_VOLUME_NAME,
         mount_path="/mnt/user-data",
         read_only=False,
     )
@@ -916,13 +920,19 @@ def _build_lark_cli_broker_sidecars(
         mount = credential_mounts.get(container_path)
         if mount is None:
             continue
-        sidecar_mount = k8s_client.V1VolumeMount(
-            name=volume_name,
-            mount_path=sidecar_path,
-            read_only=mount.read_only,
-        )
         if USERDATA_PVC_NAME:
-            sidecar_mount.sub_path = _extra_mount_pvc_sub_path(mount.host_path)
+            sidecar_mount = k8s_client.V1VolumeMount(
+                name=USERDATA_VOLUME_NAME,
+                mount_path=sidecar_path,
+                read_only=mount.read_only,
+                sub_path=_extra_mount_pvc_sub_path(mount.host_path),
+            )
+        else:
+            sidecar_mount = k8s_client.V1VolumeMount(
+                name=volume_name,
+                mount_path=sidecar_path,
+                read_only=mount.read_only,
+            )
         volume_mounts.append(sidecar_mount)
     broker_env = [
         k8s_client.V1EnvVar(name="LARKSUITE_CLI_CONFIG_DIR", value=LARK_BROKER_SIDECAR_CONFIG_PATH),

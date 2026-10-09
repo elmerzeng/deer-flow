@@ -222,6 +222,15 @@ This moves legacy `threads/{thread_id}/user-data` data under `users/<target-user
 
 In hostPath mode, the gateway materializes enabled-only views under `skills_view/public` and `users/{user_id}/skills_view/{custom,legacy}` beneath `DEER_FLOW_HOST_BASE_DIR`; the provisioner mounts those stable directories. A lead Agent with an explicit skills policy supplies all four category mounts from `users/{user_id}/threads/{thread_id}/skills_view`; those overrides replace the default hostPath or root skills-PVC mount. When `USERDATA_PVC_NAME` is configured, the provisioner mounts these thread categories from that PVC using `deer-flow/users/{user_id}/threads/{thread_id}/skills_view/{category}` subpaths. For unrestricted threads, operators can still set `SKILLS_PVC_NAME` and optionally configure `SKILLS_PVC_SUBPATH_TEMPLATE`; leaving the template empty mounts the skills PVC root unchanged. The gateway does not populate the unrestricted `SKILLS_PVC_SUBPATH_TEMPLATE` layout dynamically.
 
+When `USERDATA_PVC_NAME` is set, **every** user-data-backed mount in a sandbox Pod
+(thread user-data, skill-category overrides, integration/config mounts, and the
+lark-cli broker credentials) is served by a single `spec.volumes` entry named
+`user-data`, each mount carrying its own `subPath`. Do not reference the same PVC
+from more than one volume entry while using `subPath`: kubelet cannot finish
+volume setup for that combination, so the Pod hangs in `ContainerCreating` until
+the gateway drops it. Add new PVC-backed mounts by extending the existing
+`user-data` entry with another `subPath`, never by adding a second volume.
+
 **hostPath skills volumes require the gateway and the K8s node to see the same `DEER_FLOW_HOST_BASE_DIR`** (single-node deployment, or NFS/shared storage mounted at that path on every node). The gateway writes the projection there before every sandbox acquire, so as long as that path is shared, the directory the provisioner mounts always exists by the time the Pod is scheduled — even a boot-time rebuild failure for one user self-heals on their next acquire, before the provisioner is called. `skills-custom` and `skills-legacy` use hostPath type `Directory` (not `DirectoryOrCreate`): if the shared-storage assumption is violated — the gateway wrote to a different node than the one the Pod lands on — Pod creation now fails visibly instead of silently mounting an empty directory. Use `SKILLS_PVC_NAME` instead of hostPath for genuinely multi-node clusters without shared storage.
 
 ### Important: K8S_API_SERVER Override

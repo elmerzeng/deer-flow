@@ -153,8 +153,15 @@ class TestBuildVolumes:
         assert posix_path(extra_vol.host_path.path) == "/state/users/alice/integrations/lark-cli/config"
         assert extra_vol.host_path.type == "DirectoryOrCreate"
 
-    def test_extra_mount_uses_userdata_pvc_when_configured(self, provisioner_module):
-        """PVC mode should use the same DeerFlow data PVC for runtime config mounts."""
+    def test_extra_mounts_share_single_userdata_pvc_volume(self, provisioner_module):
+        """PVC mode keeps one user-data volume entry for any number of extra mounts.
+
+        Referencing the same PVC from several ``spec.volumes`` entries while
+        using ``subPath`` leaves kubelet unable to finish volume setup, so the
+        Pod hangs in ``ContainerCreating``. Every extra mount therefore shares
+        the single ``user-data`` entry (each with its own subPath) instead of
+        adding an ``extra-N`` volume.
+        """
         provisioner_module.SKILLS_PVC_NAME = ""
         provisioner_module.USERDATA_PVC_NAME = "userdata-pvc"
         provisioner_module.DEER_FLOW_HOST_BASE_DIR = "/state"
@@ -168,13 +175,18 @@ class TestBuildVolumes:
 
         volumes = provisioner_module._build_volumes("thread-1", extra_mounts=extra_mounts)
 
-        # Three skill projections + user-data (4 base) + 1 extra volume.
-        assert len(volumes) == 5
-        extra_vol = volumes[-1]
-        assert extra_vol.name == "extra-0"
-        assert extra_vol.persistent_volume_claim is not None
-        assert extra_vol.persistent_volume_claim.claim_name == "userdata-pvc"
-        assert extra_vol.host_path is None
+        # Three skill projections + the single user-data volume; no extra-* PVC volumes.
+        assert [volume.name for volume in volumes] == [
+            "skills-public",
+            "skills-custom",
+            "skills-legacy",
+            "user-data",
+        ]
+        assert not [volume for volume in volumes if volume.name.startswith("extra-")]
+        userdata_vol = volumes[-1]
+        assert userdata_vol.persistent_volume_claim is not None
+        assert userdata_vol.persistent_volume_claim.claim_name == "userdata-pvc"
+        assert userdata_vol.host_path is None
 
     def test_extra_mount_rejects_paths_outside_deerflow_state(self, provisioner_module):
         """Provisioner must not accept arbitrary hostPath mounts from clients."""
@@ -253,10 +265,13 @@ class TestBuildVolumes:
             extra_mounts=_thread_skill_mounts(provisioner_module),
         )
 
-        assert all(volume.name != "skills" for volume in volumes)
-        extra_volumes = [volume for volume in volumes if volume.name.startswith("extra-")]
-        assert len(extra_volumes) == 4
-        assert all(volume.persistent_volume_claim.claim_name == "userdata-pvc" for volume in extra_volumes)
+        # The overridden skill categories and the shared user-data volume all
+        # collapse onto the one user-data PVC entry: no ``skills`` volume and no
+        # per-mount ``extra-*`` volumes that would wedge kubelet subPath setup.
+        assert [volume.name for volume in volumes] == ["user-data"]
+        userdata_vol = volumes[0]
+        assert userdata_vol.persistent_volume_claim is not None
+        assert userdata_vol.persistent_volume_claim.claim_name == "userdata-pvc"
 
 
 # ── _build_volume_mounts ───────────────────────────────────────────────
@@ -411,7 +426,7 @@ class TestBuildVolumeMounts:
         mounts = provisioner_module._build_volume_mounts("thread-1", extra_mounts=extra_mounts)
 
         extra_mount = mounts[-1]
-        assert extra_mount.name == "extra-0"
+        assert extra_mount.name == provisioner_module.USERDATA_VOLUME_NAME
         assert extra_mount.sub_path == "deer-flow/users/alice/integrations/lark-cli/config"
 
     def test_extra_mount_rejects_unknown_container_path(self, provisioner_module):
@@ -471,6 +486,7 @@ class TestBuildVolumeMounts:
         skill_mounts = [mount for mount in mounts if mount.mount_path.startswith("/mnt/skills/")]
         assert len(skill_mounts) == 4
         assert all(mount.name != "skills" for mount in mounts)
+        assert {mount.name for mount in skill_mounts} == {provisioner_module.USERDATA_VOLUME_NAME}
         assert {mount.sub_path for mount in skill_mounts} == {f"deer-flow/users/alice/threads/thread-1/skills_view/{category}" for category in ("public", "custom", "legacy", "integrations")}
 
     @pytest.mark.parametrize("use_userdata_pvc", [False, True])
@@ -640,6 +656,56 @@ class TestBuildPodVolumes:
         mount_paths = {mount.mount_path for mount in pod.spec.containers[0].volume_mounts}
         assert "/mnt/integrations/lark-cli/config" in mount_paths
         assert "/mnt/integrations/lark-cli/data" in mount_paths
+
+    def test_pod_pvc_extra_mounts_share_one_volume_entry(self, provisioner_module):
+        """A PVC-backed Pod must expose exactly one user-data volume entry.
+
+        kubelet cannot finish mounting a CephFS PVC that is referenced by several
+        ``spec.volumes`` entries while ``subPath`` is in play, so every extra
+        mount has to reuse the single ``user-data`` entry.
+        """
+        provisioner_module.SKILLS_PVC_NAME = ""
+        provisioner_module.USERDATA_PVC_NAME = "userdata-pvc"
+        provisioner_module.DEER_FLOW_HOST_BASE_DIR = "/state"
+        extra_mounts = [
+            provisioner_module.ExtraMount(
+                host_path="/state/users/alice/integrations/lark-cli/config",
+                container_path="/mnt/integrations/lark-cli/config",
+                read_only=True,
+            ),
+            provisioner_module.ExtraMount(
+                host_path="/state/users/alice/integrations/lark-cli/config/locks",
+                container_path="/mnt/integrations/lark-cli/config/locks",
+                read_only=False,
+            ),
+            provisioner_module.ExtraMount(
+                host_path="/state/users/alice/integrations/lark-cli/data",
+                container_path="/mnt/integrations/lark-cli/data",
+                read_only=False,
+            ),
+        ]
+
+        pod = provisioner_module._build_pod(
+            "sandbox-1",
+            "thread-1",
+            user_id="alice",
+            extra_mounts=extra_mounts,
+        )
+
+        volume_names = [volume.name for volume in pod.spec.volumes]
+        assert len(volume_names) == len(set(volume_names))
+        pvc_volumes = [v for v in pod.spec.volumes if v.persistent_volume_claim is not None]
+        assert [v.name for v in pvc_volumes] == ["user-data"]
+
+        mount_paths = {m.mount_path: m for m in pod.spec.containers[0].volume_mounts}
+        for path in (
+            "/mnt/user-data",
+            "/mnt/integrations/lark-cli/config",
+            "/mnt/integrations/lark-cli/config/locks",
+            "/mnt/integrations/lark-cli/data",
+        ):
+            assert mount_paths[path].name == "user-data"
+            assert mount_paths[path].sub_path is not None
 
     def test_pod_three_way_skills_mount_paths(self, provisioner_module):
         """Ensure public/custom/legacy mount paths are correct."""
@@ -863,6 +929,40 @@ class TestLarkCliBrokerSidecar:
         assert "/mnt/integrations/lark-cli/data" not in sandbox_paths
         env = {e.name: e.value for e in (sandbox.env or [])}
         assert env.get("DEERFLOW_LARK_BROKER_URL") == provisioner_module.LARK_BROKER_URL
+
+    def test_broker_pvc_sidecar_reuses_userdata_volume_entry(self, provisioner_module):
+        """Broker credential mounts share the single user-data PVC entry in PVC mode."""
+        provisioner_module.SKILLS_PVC_NAME = ""
+        provisioner_module.USERDATA_PVC_NAME = "userdata-pvc"
+        provisioner_module.DEER_FLOW_HOST_BASE_DIR = "/state"
+        provisioner_module.LARK_CLI_BROKER_IMAGE = "deer-flow/lark-cli-broker:v1.0.65"
+        pod = provisioner_module._build_pod(
+            "sandbox-1",
+            "thread-1",
+            user_id="alice",
+            extra_mounts=self._credential_mounts(provisioner_module),
+            provision_lark_cli_broker=True,
+        )
+
+        volume_names = [volume.name for volume in pod.spec.volumes]
+        assert len(volume_names) == len(set(volume_names))
+        pvc_volumes = [v for v in pod.spec.volumes if v.persistent_volume_claim is not None]
+        assert [v.name for v in pvc_volumes] == ["user-data"]
+
+        sidecar = next(c for c in pod.spec.containers if c.name == "lark-cli-broker")
+        sidecar_mounts = {m.mount_path: m for m in sidecar.volume_mounts}
+        for path in (
+            provisioner_module.LARK_BROKER_SIDECAR_CONFIG_PATH,
+            provisioner_module.LARK_BROKER_SIDECAR_LOCKS_PATH,
+            provisioner_module.LARK_BROKER_SIDECAR_DATA_PATH,
+        ):
+            assert sidecar_mounts[path].name == "user-data"
+            assert sidecar_mounts[path].sub_path is not None
+
+        # Credentials stay out of the sandbox container even when shared by name.
+        sandbox_paths = {m.mount_path for m in pod.spec.containers[0].volume_mounts}
+        assert provisioner_module.LARK_CLI_CONFIG_CONTAINER_PATH not in sandbox_paths
+        assert provisioner_module.LARK_CLI_DATA_CONTAINER_PATH not in sandbox_paths
 
     def test_custom_skills_root_is_compatible_with_broker_credentials(
         self,

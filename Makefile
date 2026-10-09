@@ -21,6 +21,25 @@ endif
 
 FRONTEND_PNPM = $(PYTHON) ../scripts/pnpm.py
 
+build-frontend:
+	docker build -t reg.hrlyit.com/bytedance/deer-flow-frontend:v2.1.0 \
+	--build-arg NPM_REGISTRY="https://registry.npmmirror.com" \
+	-f frontend/Dockerfile .
+
+build-backend:
+	docker build -t reg.hrlyit.com/bytedance/deer-flow-backend:v2.1.0 -f backend/Dockerfile .
+
+build-provisioner:
+	docker build -t reg.hrlyit.com/bytedance/deer-flow-provisioner:v2.1.0-fix-volume \
+    --build-arg APT_MIRROR="mirrors.aliyun.com"  \
+    --build-arg PIP_INDEX_URL="https://mirrors.aliyun.com/pypi/simple/" \
+    ./docker/provisioner/
+
+build-skills:
+	docker build -t reg.hrlyit.com/bytedance/deer-flow-skills:v2.1.0 \
+	-f ./docker/skills.Dockerfile \
+	.
+
 help:
 	@echo "DeerFlow Development Commands:"
 	@echo "  make setup           - Interactive setup wizard (recommended for new users)"
